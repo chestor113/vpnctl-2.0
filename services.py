@@ -1,29 +1,89 @@
 from datetime import datetime, timedelta, UTC
+from pathlib import Path
+from typing import Any
 import logging
-import db
+import shutil
 import uuid
+
 import awg
 import awg_config
 import awg_server_config
-from result import Result
 import config
+import db
 import deploy
-from pathlib import Path
-import shutil
+
+from result import Result
 
 
 logger = logging.getLogger(__name__)
 
-# ФУНКЦИИ ПОМОШНИКИ
+PROJECT_DIR = Path(__file__).resolve().parent
+OUTPUT_DIR = PROJECT_DIR / "output"
 
-# ПОМОГАЕТ ПО ТЕЛЕГРАМУ ИСКАТЬ, ЧТОБЫ НЕ ПИСАТЬ ПО 9 СТРОК В КАЖДОЙ ФУНКЦИИ
-def get_user_by_telegram(tg: str):
+AWG_NETWORK = "10.10.0.0/24"
+AWG_BASE_CONFIG = Path("/etc/amnezia/amneziawg/awg0.base.conf")
+
+DEFAULT_DNS = "8.8.8.8"
+DEFAULT_DEVICE_TAG = "phone"
+REGULAR_ACCESS_TAG = "regular"
+DEFAULT_ACCESS_DAYS = 180
+DATETIME_FORMAT = "%Y-%m-%d %H:%M:%S"
+
+
+def _result_dict(result: Result) -> dict[str, Any]:
+    if isinstance(result.data, dict):
+        return result.data
+    return {}
+
+
+def _safe_name(value: Any) -> str:
+    value = str(value or "")
+    return "".join(
+        char if char.isalnum() or char in "-_." else "_"
+        for char in value
+    )
+
+
+def _normalize_access_tag(value: Any) -> str:
+    tag = str(value or REGULAR_ACCESS_TAG).strip().lower()
+    return tag or REGULAR_ACCESS_TAG
+
+
+def _device_tag_from_args(args: Any) -> str:
+    tag = (
+        getattr(args, "device", None)
+        or getattr(args, "device_tag", None)
+        or DEFAULT_DEVICE_TAG
+    )
+    tag = str(tag).strip()
+    return tag or DEFAULT_DEVICE_TAG
+
+
+def _parse_db_datetime(value: Any) -> datetime | None:
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            return value.replace(tzinfo=UTC)
+        return value.astimezone(UTC)
+    return datetime.strptime(str(value), DATETIME_FORMAT).replace(tzinfo=UTC)
+
+
+def _regular_access_expired(user: dict[str, Any]) -> bool:
+    if user.get("access_tag") != REGULAR_ACCESS_TAG:
+        return False
+    expires_at = _parse_db_datetime(user.get("expires_at"))
+    if expires_at is None:
+        return True
+    return expires_at <= datetime.now(UTC)
+
+
+def get_user_by_telegram(tg: str) -> Result:
     if not tg:
         logger.error("Telegram is required")
         return Result(False, error="Telegram is required")
 
-    row = db.find_by_telegram(tg)
-
+    row = db.get_grant_by_telegram(tg)
     if row is None:
         logger.warning("User not found: telegram=%s", tg)
         return Result(False, error=f"User not found: telegram={tg}")
@@ -31,386 +91,661 @@ def get_user_by_telegram(tg: str):
     return Result(True, data=row)
 
 
-# ФУНКЦИЯ ДЛЯ ТОГО ЧТОБЫ ПЕРЕСОБРАТЬ КОНФИГУ ПОСЛЕ УДАЛЕНИЯ ИЛИ ИЗМЕНЕНИЯ
-def rebuild_server_awg_config():
+def _device_dir_name(user: dict[str, Any], device: dict[str, Any]) -> str:
+    owner = _safe_name(user.get("telegram") or user["uuid"])
+    tag = _safe_name(device["device_tag"])
+    short_uuid = str(device["uuid"]).split("-")[0]
+    return f"{owner}_{tag}_{short_uuid}"
+
+
+def _client_awg_data(user: dict[str, Any], device: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "client_pub_key": device["wg_public_key"],
+        "client_pr_key": device["wg_private_key"],
+        "preshared_key": device.get("wg_preshared_key"),
+        "client_ip": device["wg_assigned_ip"],
+        "server_pub_key": config.get_server_public_key(),
+        "endpoint": config.get_endpoint(),
+        "telegram": user.get("telegram"),
+        "dns": DEFAULT_DNS,
+    }
+
+
+def _save_client_config(user: dict[str, Any], device: dict[str, Any]) -> Path:
+    awg_data = _client_awg_data(user, device)
+    client_config = awg_config.render_client_config(awg_data)
+    dir_name = _device_dir_name(user, device)
+    return awg_config.save_client_config(client_config, dir_name, "awg.conf")
+
+
+def _remove_device_output(user: dict[str, Any], device: dict[str, Any]) -> None:
+    path = OUTPUT_DIR / _device_dir_name(user, device)
+    if path.exists():
+        shutil.rmtree(path)
+
+
+def _get_device_for_user(args: Any, user: dict[str, Any]) -> Result:
+    device_uuid = getattr(args, "device_uuid", None)
+
+    if device_uuid:
+        device = db.get_device_by_uuid(device_uuid)
+        if device is None:
+            return Result(False, error=f"Device not found: uuid={device_uuid}")
+        if device["access_grant_uuid"] != user["uuid"]:
+            return Result(False, error="Device does not belong to this user")
+        return Result(True, data=device)
+
+    device_tag = getattr(args, "device", None) or getattr(args, "device_tag", None)
+    if not device_tag:
+        return Result(False, error="Device tag or device UUID is required")
+
+    device = db.get_device_by_tag(user["uuid"], str(device_tag))
+    if device is None:
+        return Result(False, error=f"Device not found: {device_tag}")
+
+    return Result(True, data=device)
+
+
+def rebuild_server_awg_config() -> Result:
     try:
+        peers = db.get_active_awg_peers()
         server_config = awg_server_config.build_server_config(
-            "/etc/amnezia/amneziawg/awg0.base.conf",
-            "amneziawg/peers",
+            base_config_path=AWG_BASE_CONFIG,
+            peers=peers,
         )
         path_config = awg_server_config.save_awg_server_conf(
             server_config,
             "awg0.conf",
         )
-        return Result(True, data={"srv_path_config": path_config.as_posix()})
+        return Result(
+            True,
+            data={
+                "srv_path_config": path_config.as_posix(),
+                "active_peers": len(peers),
+            },
+        )
     except Exception:
-        logger.exception("Cant rebuild AWG server config")
+        logger.exception("Can't rebuild AWG server config")
         return Result(False, error="Failed to rebuild server config")
 
 
-# ПОМОШНИК ДЛЯ МАППИНГА
-def map_db_to_config():
+def rebuild_and_deploy() -> Result:
+    config_result = rebuild_server_awg_config()
+    if not config_result:
+        return config_result
+
+    deploy_result = deploy.deploy_server_config()
+    if not deploy_result:
+        return deploy_result
+
+    return Result(
+        True,
+        data={
+            **_result_dict(config_result),
+            **_result_dict(deploy_result),
+        },
+    )
+
+
+def map_db_to_config() -> list[dict[str, Any]]:
     return [
-        {"id": row["uuid"], "email": row["telegram"] or row["uuid"]}
-        for row in db.get_active_clients()
+        {
+            "id": row["device_uuid"],
+            "email": row["telegram"] or row["grant_uuid"],
+        }
+        for row in db.get_active_awg_peers()
     ]
 
 
-def handle_create(args):
+def handle_create(args: Any) -> Result:
     try:
-        check_unique = db.find_by_telegram(args.telegram)
-        if check_unique:
-            logger.error("Users already exists with tg = %s", args.telegram)
-            return Result(False, error="Users already exists")
+        telegram = str(args.telegram).strip()
+        username = str(args.username).strip()
 
-        user_uuid = uuid.uuid4()
+        if not telegram:
+            return Result(False, error="Telegram is required")
+        if not username:
+            return Result(False, error="Username is required")
+        if db.get_grant_by_telegram(telegram):
+            return Result(False, error="User already exists")
+
+        access_tag = _normalize_access_tag(
+            getattr(args, "tag", REGULAR_ACCESS_TAG)
+        )
+        created_at = datetime.now(UTC)
+
+        if access_tag == REGULAR_ACCESS_TAG:
+            days = int(getattr(args, "days", DEFAULT_ACCESS_DAYS))
+            if days <= 0:
+                return Result(
+                    False,
+                    error="Days must be greater than zero for regular access",
+                )
+            expires_at = created_at + timedelta(days=days)
+        else:
+            days = None
+            expires_at = None
+
+        device_tag = _device_tag_from_args(args)
         awg_keys = awg.gen_awg_keys()
-        awg_ip = awg.get_awg_free_ip("10.10.0.0/24", db.get_ip_addresses())
-
-        awg_server_pub = config.get_server_public_key()
-        awg_endpoint = config.get_endpoint()
+        awg_ip = awg.get_awg_free_ip(
+            AWG_NETWORK,
+            db.get_used_ip_addresses(),
+        )
 
         if awg_ip is None:
-            logger.error("Create failed: no free AmneziaWG IP available")
-            return Result(False, error="Create failed: no free AmneziaWG IP available")
+            return Result(False, error="No free AmneziaWG IP available")
 
-        created_at = datetime.now(UTC)
-        expires_at = created_at + timedelta(days=args.days)
+        grant_uuid = str(uuid.uuid4())
+        device_uuid = str(uuid.uuid4())
 
-        payload = {
-            "uuid": str(user_uuid),
-            "username": args.username,
-            "telegram": args.telegram,
-            "created_at": created_at.strftime("%Y-%m-%d %H:%M:%S"),
-            "expires_at": expires_at.strftime("%Y-%m-%d %H:%M:%S"),
+        grant_payload = {
+            "uuid": grant_uuid,
+            "username": username,
+            "telegram": telegram,
+            "created_at": created_at,
+            "expires_at": expires_at,
             "is_enabled": 1,
-            "access_tag": args.tag,
-            # Legacy DB column names are kept for compatibility with the existing database.
+            "access_tag": access_tag,
+        }
+
+        device_payload = {
+            "uuid": device_uuid,
+            "device_tag": device_tag,
+            "created_at": created_at,
+            "is_enabled": 1,
             "wg_public_key": awg_keys["public_key"],
             "wg_private_key": awg_keys["private_key"],
-            "wg_preshared_key": awg_keys["preshared_key"],
+            "wg_preshared_key": awg_keys.get("preshared_key"),
             "wg_assigned_ip": awg_ip,
         }
 
-        row_id = db.insert_grant(payload)
-        if row_id is None:
-            logger.error("Create failed: failed to insert grant into DB")
-            return Result(False, error="Create failed: failed to insert grant into DB")
-
-        awg_data = {
-            "client_pub_key": awg_keys["public_key"],
-            "client_pr_key": awg_keys["private_key"],
-            "preshared_key": awg_keys["preshared_key"],
-            "client_ip": awg_ip,
-            "server_pub_key": awg_server_pub,
-            "endpoint": awg_endpoint,
-            "telegram": args.telegram,
-            "dns": "8.8.8.8",
-        }
-
-        dir_name = f'{args.telegram.replace(" ", "_")}_{user_uuid}'
-
-        client_config = awg_config.render_client_config(awg_data)
-        config_path = awg_config.save_client_config(
-            client_config,
-            dir_name,
-            "awg.conf",
+        created = db.create_grant_with_first_device(
+            grant_payload,
+            device_payload,
         )
+        if created is None:
+            return Result(False, error="Failed to create user and device in DB")
 
-        peer_config = awg_config.render_server_peer(awg_data)
-        peer_path_config = awg_config.save_peer_config(
-            peer_config,
-            dir_name,
-            "peer.conf",
-        )
+        user = db.get_grant_by_uuid(grant_uuid)
+        device = db.get_device_by_uuid(device_uuid)
+        if user is None or device is None:
+            db.delete_grant_by_uuid(grant_uuid)
+            return Result(False, error="Created data could not be read back from DB")
 
-        config_result = rebuild_server_awg_config()
-        if not config_result:
-            return config_result
+        try:
+            config_path = _save_client_config(user, device)
+        except Exception:
+            logger.exception("Failed to create client config for %s", device_uuid)
+            db.delete_grant_by_uuid(grant_uuid)
+            return Result(False, error="Failed to create client configuration")
 
-        deploy_result = deploy.deploy_server_config()
-        if not deploy_result:
-            return deploy_result
+        runtime_result = rebuild_and_deploy()
+        if not runtime_result:
+            return Result(
+                False,
+                data={
+                    "grant_uuid": grant_uuid,
+                    "device_uuid": device_uuid,
+                    "config_path": config_path.as_posix(),
+                },
+                error=runtime_result.error,
+            )
 
         logger.info(
-            "Create success: uuid=%s, username=%s, telegram=%s, expires_at=%s, awg_ip=%s",
-            str(user_uuid),
-            args.username,
-            args.telegram,
-            expires_at.strftime("%Y-%m-%d %H:%M:%S"),
+            "Create success: user=%s telegram=%s tag=%s device=%s ip=%s",
+            username,
+            telegram,
+            access_tag,
+            device_tag,
             awg_ip,
         )
 
         return Result(
             True,
             data={
-                "id": row_id,
-                "uuid": str(user_uuid),
-                "username": args.username,
-                "telegram": args.telegram,
-                "expires_at": expires_at.strftime("%Y-%m-%d %H:%M:%S"),
+                "grant_uuid": grant_uuid,
+                "device_uuid": device_uuid,
+                "username": username,
+                "telegram": telegram,
+                "access_tag": access_tag,
+                "device_tag": device_tag,
+                "expires_at": (
+                    expires_at.strftime(DATETIME_FORMAT)
+                    if expires_at
+                    else None
+                ),
+                "days": days,
                 "awg_ip": awg_ip,
                 "config_path": config_path.as_posix(),
-                "peer_path_config": peer_path_config.as_posix(),
-                "srv_path_config": config_result.data["srv_path_config"],
+                **_result_dict(runtime_result),
             },
         )
+
+    except (TypeError, ValueError):
+        return Result(False, error="Invalid create arguments")
     except Exception:
         logger.exception(
-            "Handle create crashed: username=%s tg: %s",
-            args.username,
-            args.telegram,
+            "Handle create crashed: username=%s telegram=%s",
+            getattr(args, "username", None),
+            getattr(args, "telegram", None),
         )
-        return Result(
-            False,
-            error=f"Handle create crashed: username={args.username}, telegram={args.telegram}",
-        )
+        return Result(False, error="Unexpected error during create")
 
 
-def handle_disable(args):
+def handle_disable(args: Any) -> Result:
     try:
         user_result = get_user_by_telegram(args.telegram)
         if not user_result:
             return user_result
-        row = user_result.data
 
-        disable_result = db.disable_by_uuid(row["uuid"], "manual")
+        user = _result_dict(user_result)
+        if not user:
+            return Result(False, error="Invalid user data")
 
-        if not disable_result:
-            logger.error(
-                "Disable is failed. username: %s, tg: %s",
-                args.username,
-                args.telegram,
-            )
-            return Result(
-                False,
-                error=f"Disable failed in DB: username={args.username}, telegram={args.telegram}",
-            )
-        logger.info("Disabled username: %s, tg: %s", row["username"], row["telegram"])
+        if not db.set_grant_enabled(user["uuid"], False, "manual"):
+            return Result(False, error="Failed to disable user in DB")
 
-        config_result = rebuild_server_awg_config()
+        runtime_result = rebuild_and_deploy()
+        if not runtime_result:
+            return runtime_result
 
-        if not config_result:
-            return config_result
-
-        deploy_result = deploy.deploy_server_config()
-
-        if not deploy_result:
-            return deploy_result
-
-        updated_result = db.find_by_uuid(row["uuid"])
+        updated = db.get_grant_by_uuid(user["uuid"])
+        if updated is None:
+            return Result(False, error="User was disabled but could not be read back")
 
         return Result(
-            disable_result,
+            True,
             data={
-                **updated_result,
-                "srv_path_config": config_result.data["srv_path_config"],
-                **deploy_result.data,
+                **updated,
+                **_result_dict(runtime_result),
             },
         )
-
     except Exception:
-        logger.exception(
-            "Disable gone wrong. username: %s tg: %s",
-            args.username,
-            args.telegram,
-        )
+        logger.exception("Disable failed: telegram=%s", getattr(args, "telegram", None))
         return Result(False, error="Unexpected error during disable")
 
 
-def handle_enable(args):
+def handle_enable(args: Any) -> Result:
     try:
         user_result = get_user_by_telegram(args.telegram)
         if not user_result:
             return user_result
 
-        row = user_result.data
+        user = _result_dict(user_result)
+        if not user:
+            return Result(False, error="Invalid user data")
 
-        enable_result = db.enable_by_uuid(row["uuid"])
+        if _regular_access_expired(user):
+            return Result(False, error="Regular access is expired; renew it instead")
 
-        if not enable_result:
-            logger.error(
-                "Enable is failed. username: %s, tg: %s",
-                args.username,
-                args.telegram,
-            )
-            return Result(
-                False,
-                error=f"Enable failed in DB: username={args.username}, telegram={args.telegram}",
-            )
-        logger.info("Enable username: %s, tg: %s", row["username"], row["telegram"])
+        if not db.set_grant_enabled(user["uuid"], True):
+            return Result(False, error="Failed to enable user in DB")
 
-        config_result = rebuild_server_awg_config()
+        runtime_result = rebuild_and_deploy()
+        if not runtime_result:
+            return runtime_result
 
-        if not config_result:
-            return config_result
-
-        deploy_result = deploy.deploy_server_config()
-        if not deploy_result:
-            return deploy_result
-        updated_result = db.find_by_uuid(row["uuid"])
+        updated = db.get_grant_by_uuid(user["uuid"])
+        if updated is None:
+            return Result(False, error="User was enabled but could not be read back")
 
         return Result(
-            enable_result,
+            True,
             data={
-                **updated_result,
-                "srv_path_config": config_result.data["srv_path_config"],
-                **deploy_result.data,
+                **updated,
+                **_result_dict(runtime_result),
             },
         )
-
+    except ValueError:
+        return Result(False, error="Invalid expiration date in DB")
     except Exception:
-        logger.exception(
-            "Enable gone wrong. username: %s tg: %s",
-            args.username,
-            args.telegram,
-        )
+        logger.exception("Enable failed: telegram=%s", getattr(args, "telegram", None))
         return Result(False, error="Unexpected error during enable")
 
 
-def handle_renew(args):
+def handle_renew(args: Any) -> Result:
     try:
         user_result = get_user_by_telegram(args.telegram)
         if not user_result:
             return user_result
 
-        row = user_result.data
+        user = _result_dict(user_result)
+        if not user:
+            return Result(False, error="Invalid user data")
 
-        renew_result = db.renew_by_uuid(row["uuid"], args.days)
-        if not renew_result:
-            logger.error(
-                "Renew failed in DB: uuid=%s, username=%s",
-                row["uuid"],
-                row["username"],
-            )
-            return Result(
-                False,
-                error=f"Renew failed in DB: uuid={row['uuid']}, username={row['username']}",
-            )
+        if user.get("access_tag") != REGULAR_ACCESS_TAG:
+            return Result(False, error="Permanent access does not need renewal")
 
-        logger.info(
-            "Renew success: username=%s, telegram=%s, days=%s",
-            row["username"],
-            row["telegram"],
-            args.days,
-        )
+        days = int(args.days)
+        if days <= 0:
+            return Result(False, error="Days must be greater than zero")
+
+        if not db.renew_grant(user["uuid"], days):
+            return Result(False, error="Failed to renew user in DB")
+
+        runtime_result = rebuild_and_deploy()
+        if not runtime_result:
+            return runtime_result
+
+        updated = db.get_grant_by_uuid(user["uuid"])
+        if updated is None:
+            return Result(False, error="User was renewed but could not be read back")
 
         return Result(
             True,
             data={
-                "uuid": row["uuid"],
-                "username": row["username"],
-                "telegram": row["telegram"],
-                "days": args.days,
+                **updated,
+                "days_added": days,
+                **_result_dict(runtime_result),
             },
         )
+    except (TypeError, ValueError):
+        return Result(False, error="Invalid renewal arguments")
     except Exception:
-        logger.exception(
-            "Handle renew crashed username: %s tg: %s",
-            args.username,
-            args.telegram,
-        )
-        return Result(
-            False,
-            error=f"Handle renew crashed username: {args.username} Tg: {args.telegram}",
-        )
+        logger.exception("Renew failed: telegram=%s", getattr(args, "telegram", None))
+        return Result(False, error="Unexpected error during renew")
 
 
-def handle_list(args):
+def handle_list(args: Any) -> Result:
     try:
-        if args.all:
-            users = db.get_all_clients()
-        elif args.active:
-            users = db.get_all_active_clients()
-        elif args.inactive:
-            users = db.get_inactive_clients()
+        if getattr(args, "active", False):
+            users = db.list_grants("enabled")
+        elif getattr(args, "inactive", False):
+            users = db.list_grants("disabled")
         else:
-            users = db.get_all_clients()
-
-        if not users:
-            logger.info("List returned no users")
-            return Result(True, data=[])
-
+            users = db.list_grants()
         return Result(True, data=users)
     except Exception:
-        logger.exception("List gone wrong")
+        logger.exception("List failed")
         return Result(False, error="Unexpected error during listing")
 
 
-def handle_delete(args):
+def handle_delete(args: Any) -> Result:
     try:
-        row = db.find_by_telegram(args.telegram)
-        if not row:
-            return Result(False, error="User not found")
+        user_result = get_user_by_telegram(args.telegram)
+        if not user_result:
+            return user_result
 
-        delete_result = db.delete_user(args.telegram)
+        user = _result_dict(user_result)
+        if not user:
+            return Result(False, error="Invalid user data")
 
-        if not delete_result:
-            return Result(False, error="User not found or already deleted")
+        devices = db.list_devices(user["uuid"])
+        if not db.delete_grant_by_uuid(user["uuid"]):
+            return Result(False, error="Failed to delete user from DB")
 
-        print(delete_result)
+        for device in devices:
+            try:
+                _remove_device_output(user, device)
+            except Exception:
+                logger.exception("Failed to remove output for device %s", device["uuid"])
 
-        # Удаляем пир папку после того как удалили из БД
-        peers = Path("amneziawg/peers")
-
-        for peer in peers.iterdir():
-            if not peer.is_dir():
-                continue
-            parts = peer.name.split("_")
-
-            if len(parts) < 2:
-                logger.warning("Invalid peer folder name: %s", peer.name)
-                continue
-            peer_uuid = parts[-1]
-
-            if peer_uuid == row["uuid"]:
-                shutil.rmtree(peer, ignore_errors=True)
-                break
-
-        config_result = rebuild_server_awg_config()
-
-        if not config_result:
-            return config_result
-
-        deploy_result = deploy.deploy_server_config()
-
-        if not deploy_result:
-            return deploy_result
-
-        return Result(True, data="User deleted successfully")
-
-    except Exception:
-        logger.exception("Deleting telegram=%s gone wrong", args.telegram)
-        return Result(False, error="Deleting gone wrong")
-
-
-def handle_expired(args):
-    try:
-        expired_uuids = db.expire_job()
-
-        if not expired_uuids:
-            logger.info("List returned no users")
-            return Result(True, data=[])
-
-        config_result = rebuild_server_awg_config()
-
-        if not config_result:
-            return config_result
-
-        deploy_result = deploy.deploy_server_config()
-
-        if not deploy_result:
-            return deploy_result
+        runtime_result = rebuild_and_deploy()
+        if not runtime_result:
+            return runtime_result
 
         return Result(
             True,
             data={
-                "expired_users": expired_uuids,
-                "srv_path_config": config_result.data["srv_path_config"],
-                **deploy_result.data,
+                "deleted_grant_uuid": user["uuid"],
+                "deleted_devices": len(devices),
+                **_result_dict(runtime_result),
             },
         )
-
     except Exception:
-        logger.exception("List gone wrong")
-        return Result(False, error="Unexpected error during listing")
+        logger.exception("Delete failed: telegram=%s", getattr(args, "telegram", None))
+        return Result(False, error="Unexpected error during delete")
+
+
+def handle_expired(args: Any) -> Result:
+    try:
+        expired_uuids = db.get_expired_grant_uuids()
+        if not expired_uuids:
+            return Result(True, data=[])
+
+        disabled = []
+        for grant_uuid in expired_uuids:
+            if db.set_grant_enabled(grant_uuid, False, "expired"):
+                disabled.append(grant_uuid)
+
+        if not disabled:
+            return Result(True, data=[])
+
+        runtime_result = rebuild_and_deploy()
+        if not runtime_result:
+            return runtime_result
+
+        return Result(
+            True,
+            data={
+                "expired_users": disabled,
+                **_result_dict(runtime_result),
+            },
+        )
+    except Exception:
+        logger.exception("Expire job failed")
+        return Result(False, error="Unexpected error during expire job")
+
+
+def handle_device_add(args: Any) -> Result:
+    try:
+        user_result = get_user_by_telegram(args.telegram)
+        if not user_result:
+            return user_result
+
+        user = _result_dict(user_result)
+        if not user:
+            return Result(False, error="Invalid user data")
+
+        device_tag = _device_tag_from_args(args)
+        if db.get_device_by_tag(user["uuid"], device_tag):
+            return Result(False, error=f"Device already exists: {device_tag}")
+
+        awg_keys = awg.gen_awg_keys()
+        awg_ip = awg.get_awg_free_ip(
+            AWG_NETWORK,
+            db.get_used_ip_addresses(),
+        )
+        if awg_ip is None:
+            return Result(False, error="No free AmneziaWG IP available")
+
+        device_uuid = str(uuid.uuid4())
+        created = db.create_device(
+            {
+                "uuid": device_uuid,
+                "access_grant_uuid": user["uuid"],
+                "device_tag": device_tag,
+                "is_enabled": 1,
+                "wg_public_key": awg_keys["public_key"],
+                "wg_private_key": awg_keys["private_key"],
+                "wg_preshared_key": awg_keys.get("preshared_key"),
+                "wg_assigned_ip": awg_ip,
+            }
+        )
+        if created is None:
+            return Result(False, error="Failed to create device in DB")
+
+        device = db.get_device_by_uuid(device_uuid)
+        if device is None:
+            db.delete_device(device_uuid)
+            return Result(False, error="Created device could not be read back from DB")
+
+        try:
+            config_path = _save_client_config(user, device)
+        except Exception:
+            logger.exception("Failed to create client config for %s", device_uuid)
+            db.delete_device(device_uuid)
+            return Result(False, error="Failed to create client configuration")
+
+        runtime_result = rebuild_and_deploy()
+        if not runtime_result:
+            return Result(
+                False,
+                data={
+                    "device_uuid": device_uuid,
+                    "config_path": config_path.as_posix(),
+                },
+                error=runtime_result.error,
+            )
+
+        return Result(
+            True,
+            data={
+                "grant_uuid": user["uuid"],
+                "device_uuid": device_uuid,
+                "device_tag": device_tag,
+                "awg_ip": awg_ip,
+                "config_path": config_path.as_posix(),
+                **_result_dict(runtime_result),
+            },
+        )
+    except Exception:
+        logger.exception("Device add failed: telegram=%s", getattr(args, "telegram", None))
+        return Result(False, error="Unexpected error during device add")
+
+
+def handle_device_list(args: Any) -> Result:
+    try:
+        user_result = get_user_by_telegram(args.telegram)
+        if not user_result:
+            return user_result
+
+        user = _result_dict(user_result)
+        if not user:
+            return Result(False, error="Invalid user data")
+
+        return Result(True, data=db.list_devices(user["uuid"]))
+    except Exception:
+        logger.exception("Device list failed: telegram=%s", getattr(args, "telegram", None))
+        return Result(False, error="Unexpected error during device listing")
+
+
+def handle_device_disable(args: Any) -> Result:
+    try:
+        user_result = get_user_by_telegram(args.telegram)
+        if not user_result:
+            return user_result
+
+        user = _result_dict(user_result)
+        if not user:
+            return Result(False, error="Invalid user data")
+
+        device_result = _get_device_for_user(args, user)
+        if not device_result:
+            return device_result
+
+        device = _result_dict(device_result)
+        if not device:
+            return Result(False, error="Invalid device data")
+
+        if not db.set_device_enabled(device["uuid"], False, "manual"):
+            return Result(False, error="Failed to disable device in DB")
+
+        runtime_result = rebuild_and_deploy()
+        if not runtime_result:
+            return runtime_result
+
+        updated = db.get_device_by_uuid(device["uuid"])
+        if updated is None:
+            return Result(False, error="Device was disabled but could not be read back")
+
+        return Result(
+            True,
+            data={
+                **updated,
+                **_result_dict(runtime_result),
+            },
+        )
+    except Exception:
+        logger.exception("Device disable failed: telegram=%s", getattr(args, "telegram", None))
+        return Result(False, error="Unexpected error during device disable")
+
+
+def handle_device_enable(args: Any) -> Result:
+    try:
+        user_result = get_user_by_telegram(args.telegram)
+        if not user_result:
+            return user_result
+
+        user = _result_dict(user_result)
+        if not user:
+            return Result(False, error="Invalid user data")
+
+        if _regular_access_expired(user):
+            return Result(False, error="Regular access is expired; renew the user first")
+
+        device_result = _get_device_for_user(args, user)
+        if not device_result:
+            return device_result
+
+        device = _result_dict(device_result)
+        if not device:
+            return Result(False, error="Invalid device data")
+
+        if not db.set_device_enabled(device["uuid"], True):
+            return Result(False, error="Failed to enable device in DB")
+
+        runtime_result = rebuild_and_deploy()
+        if not runtime_result:
+            return runtime_result
+
+        updated = db.get_device_by_uuid(device["uuid"])
+        if updated is None:
+            return Result(False, error="Device was enabled but could not be read back")
+
+        return Result(
+            True,
+            data={
+                **updated,
+                **_result_dict(runtime_result),
+            },
+        )
+    except ValueError:
+        return Result(False, error="Invalid expiration date in DB")
+    except Exception:
+        logger.exception("Device enable failed: telegram=%s", getattr(args, "telegram", None))
+        return Result(False, error="Unexpected error during device enable")
+
+
+def handle_device_delete(args: Any) -> Result:
+    try:
+        user_result = get_user_by_telegram(args.telegram)
+        if not user_result:
+            return user_result
+
+        user = _result_dict(user_result)
+        if not user:
+            return Result(False, error="Invalid user data")
+
+        device_result = _get_device_for_user(args, user)
+        if not device_result:
+            return device_result
+
+        device = _result_dict(device_result)
+        if not device:
+            return Result(False, error="Invalid device data")
+
+        if not db.delete_device(device["uuid"]):
+            return Result(False, error="Failed to delete device from DB")
+
+        try:
+            _remove_device_output(user, device)
+        except Exception:
+            logger.exception("Failed to remove output for device %s", device["uuid"])
+
+        runtime_result = rebuild_and_deploy()
+        if not runtime_result:
+            return runtime_result
+
+        return Result(
+            True,
+            data={
+                "deleted_device_uuid": device["uuid"],
+                "device_tag": device["device_tag"],
+                **_result_dict(runtime_result),
+            },
+        )
+    except Exception:
+        logger.exception("Device delete failed: telegram=%s", getattr(args, "telegram", None))
+        return Result(False, error="Unexpected error during device delete")

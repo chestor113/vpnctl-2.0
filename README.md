@@ -120,13 +120,3 @@ sqlite3 db.sqlite ".tables"
 ```
 
 Ansible ставит зависимости, забирает код и при первой установке создаёт SQLite-базу.
-
-## Не хранить в Git
-
-```text
-db.sqlite
-secrets/
-output/
-*.key
-.env
-```

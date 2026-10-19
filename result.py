@@ -1,10 +1,16 @@
-from dataclasses import dataclass
+from typing import Any
 
-@dataclass
+
 class Result:
-    ok: bool
-    data: dict | None = None
-    error: str | None = None
+    def __init__(
+        self,
+        success: bool,
+        data: Any = None,
+        error: str | None = None,
+    ):
+        self.success = success
+        self.data = data
+        self.error = error
 
-    def __bool__(self):
-        return self.ok
+    def __bool__(self) -> bool:
+        return self.success

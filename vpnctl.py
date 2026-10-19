@@ -1,18 +1,48 @@
 import logging
+import sys
+from typing import Any
+
 import cli
 from logger_config import setup_logging
-from pathlib import Path
-import sys
+
 
 logger = logging.getLogger(__name__)
 
 
+SENSITIVE_KEYS = {
+    "wg_private_key",
+    "wg_preshared_key",
+    "private_key",
+    "preshared_key",
+    "client_pr_key",
+}
 
-def print_result_data(data):
+
+def _safe_dict(data: dict[str, Any]) -> dict[str, Any]:
+    """
+    Hide sensitive key material from CLI output.
+    """
+
+    return {
+        key: (
+            "<hidden>"
+            if key in SENSITIVE_KEYS and value
+            else value
+        )
+        for key, value in data.items()
+    }
+
+
+def print_result_data(data: Any) -> None:
+    if data is None:
+        return
+
     if isinstance(data, dict):
-        # for key, value in data.items():
-        #     print(f"{key}: {value}")
-        print(data)
+        safe_data = _safe_dict(data)
+
+        for key, value in safe_data.items():
+            print(f"{key}: {value}")
+
         return
 
     if isinstance(data, list):
@@ -20,48 +50,97 @@ def print_result_data(data):
             print("No data")
             return
 
-        if isinstance(data[0], dict):
-            for user in data:
-                print(user)
-            return
+        for index, item in enumerate(
+            data,
+            start=1,
+        ):
+            if isinstance(item, dict):
+                safe_item = _safe_dict(item)
 
-        for item in data:
-            print(item)
+                if len(data) > 1:
+                    print(f"[{index}]")
+
+                for key, value in safe_item.items():
+                    print(f"{key}: {value}")
+
+                if index < len(data):
+                    print()
+
+            else:
+                print(item)
+
         return
 
     print(data)
 
 
-def main():
-    setup_logging()
-
-    
-
-def main():
+def main() -> int:
     setup_logging()
 
     parser = cli.build_parser()
 
-    argv = sys.argv[:]
+    argv = sys.argv[1:]
 
-    if len(argv) > 1:
-        argv[1] = argv[1].lower()
+    if argv:
+        argv[0] = argv[0].lower()
 
-    args = parser.parse_args(argv[1:])
-    
-    result = args.handler(args)
+    args = parser.parse_args(argv)
+
+    try:
+        result = args.handler(args)
+
+    except KeyboardInterrupt:
+        print("\nInterrupted")
+        logger.warning(
+            "Operation interrupted by user"
+        )
+        return 130
+
+    except Exception:
+        logger.exception(
+            "Unhandled vpnctl error"
+        )
+
+        print(
+            "ERROR: unexpected internal error"
+        )
+
+        return 1
 
     if not result:
-        print(f"ERROR: {result.error}")
-        logger.error("Operation failed: %s", result.error)
-        return
+        error = (
+            result.error
+            or "Operation failed"
+        )
 
-    if result.data:
-        print_result_data(result.data)
+        print(
+            f"ERROR: {error}",
+            file=sys.stderr,
+        )
 
-    logger.info("Operation completed successfully")
+        logger.error(
+            "Operation failed: %s",
+            error,
+        )
 
+        if result.data is not None:
+            print_result_data(
+                result.data
+            )
+
+        return 1
+
+    if result.data is not None:
+        print_result_data(
+            result.data
+        )
+
+    logger.info(
+        "Operation completed successfully"
+    )
+
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
