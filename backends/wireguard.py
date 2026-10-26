@@ -18,7 +18,7 @@ NETWORK = os.getenv(
 
 INTERFACE = os.getenv(
     "WG_INTERFACE",
-    "wg-vpnctl",
+    "wg0",
 )
 
 CONFIG_DIR = Path(
