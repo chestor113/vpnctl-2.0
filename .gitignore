@@ -10,10 +10,15 @@ secrets/
 .vault_pass
 *.key
 
-# Generated VPN configs
+# Generated client configs
 output/
-wireguard/peers/
-wireguard/server_config/
+
+# Generated AWG server config
+amneziawg/server_config/
+
+# Old generated paths
+wireguard/
+amneziawg/peers/
 
 # Backups and logs
 backups/

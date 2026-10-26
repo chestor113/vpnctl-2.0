@@ -5,23 +5,18 @@ import logging
 import shutil
 import uuid
 
-import awg
-import awg_config
-import awg_server_config
 import config
 import db
-import deploy
 
 from result import Result
+from backends import get_backend
 
 
 logger = logging.getLogger(__name__)
+backend = get_backend()
 
 PROJECT_DIR = Path(__file__).resolve().parent
 OUTPUT_DIR = PROJECT_DIR / "output"
-
-AWG_NETWORK = "10.10.0.0/24"
-AWG_BASE_CONFIG = Path("/etc/amnezia/amneziawg/awg0.base.conf")
 
 DEFAULT_DNS = "8.8.8.8"
 DEFAULT_DEVICE_TAG = "phone"
@@ -98,7 +93,7 @@ def _device_dir_name(user: dict[str, Any], device: dict[str, Any]) -> str:
     return f"{owner}_{tag}_{short_uuid}"
 
 
-def _client_awg_data(user: dict[str, Any], device: dict[str, Any]) -> dict[str, Any]:
+def _client_vpn_data(user: dict[str, Any], device: dict[str, Any]) -> dict[str, Any]:
     return {
         "client_pub_key": device["wg_public_key"],
         "client_pr_key": device["wg_private_key"],
@@ -112,10 +107,10 @@ def _client_awg_data(user: dict[str, Any], device: dict[str, Any]) -> dict[str, 
 
 
 def _save_client_config(user: dict[str, Any], device: dict[str, Any]) -> Path:
-    awg_data = _client_awg_data(user, device)
-    client_config = awg_config.render_client_config(awg_data)
+    vpn_data = _client_vpn_data(user, device)
+    client_config = backend.render_client_config(vpn_data)
     dir_name = _device_dir_name(user, device)
-    return awg_config.save_client_config(client_config, dir_name, "awg.conf")
+    return backend.save_client_config(client_config, dir_name)
 
 
 def _remove_device_output(user: dict[str, Any], device: dict[str, Any]) -> None:
@@ -146,35 +141,42 @@ def _get_device_for_user(args: Any, user: dict[str, Any]) -> Result:
     return Result(True, data=device)
 
 
-def rebuild_server_awg_config() -> Result:
+def rebuild_server_config() -> Result:
     try:
+        # Legacy DB method name is kept for compatibility.
+        # The rows themselves are suitable for both WG and AWG backends.
         peers = db.get_active_awg_peers()
-        server_config = awg_server_config.build_server_config(
-            base_config_path=AWG_BASE_CONFIG,
-            peers=peers,
-        )
-        path_config = awg_server_config.save_awg_server_conf(
-            server_config,
-            "awg0.conf",
-        )
+
+        server_config = backend.build_server_config(peers)
+        path_config = backend.save_server_config(server_config)
+
         return Result(
             True,
             data={
+                "vpn_backend": backend.NAME,
                 "srv_path_config": path_config.as_posix(),
                 "active_peers": len(peers),
             },
         )
     except Exception:
-        logger.exception("Can't rebuild AWG server config")
+        logger.exception(
+            "Can't rebuild %s server config",
+            backend.NAME,
+        )
         return Result(False, error="Failed to rebuild server config")
 
 
+def rebuild_server_awg_config() -> Result:
+    # Temporary compatibility alias for older callers.
+    return rebuild_server_config()
+
+
 def rebuild_and_deploy() -> Result:
-    config_result = rebuild_server_awg_config()
+    config_result = rebuild_server_config()
     if not config_result:
         return config_result
 
-    deploy_result = deploy.deploy_server_config()
+    deploy_result = backend.deploy_server_config()
     if not deploy_result:
         return deploy_result
 
@@ -227,14 +229,16 @@ def handle_create(args: Any) -> Result:
             expires_at = None
 
         device_tag = _device_tag_from_args(args)
-        awg_keys = awg.gen_awg_keys()
-        awg_ip = awg.get_awg_free_ip(
-            AWG_NETWORK,
+        vpn_keys = backend.generate_keys()
+        vpn_ip = backend.get_free_ip(
             db.get_used_ip_addresses(),
         )
 
-        if awg_ip is None:
-            return Result(False, error="No free AmneziaWG IP available")
+        if vpn_ip is None:
+            return Result(
+                False,
+                error=f"No free {backend.NAME} IP available",
+            )
 
         grant_uuid = str(uuid.uuid4())
         device_uuid = str(uuid.uuid4())
@@ -254,10 +258,10 @@ def handle_create(args: Any) -> Result:
             "device_tag": device_tag,
             "created_at": created_at,
             "is_enabled": 1,
-            "wg_public_key": awg_keys["public_key"],
-            "wg_private_key": awg_keys["private_key"],
-            "wg_preshared_key": awg_keys.get("preshared_key"),
-            "wg_assigned_ip": awg_ip,
+            "wg_public_key": vpn_keys["public_key"],
+            "wg_private_key": vpn_keys["private_key"],
+            "wg_preshared_key": vpn_keys.get("preshared_key"),
+            "wg_assigned_ip": vpn_ip,
         }
 
         created = db.create_grant_with_first_device(
@@ -298,7 +302,7 @@ def handle_create(args: Any) -> Result:
             telegram,
             access_tag,
             device_tag,
-            awg_ip,
+            vpn_ip,
         )
 
         return Result(
@@ -316,7 +320,8 @@ def handle_create(args: Any) -> Result:
                     else None
                 ),
                 "days": days,
-                "awg_ip": awg_ip,
+                "vpn_backend": backend.NAME,
+                "vpn_ip": vpn_ip,
                 "config_path": config_path.as_posix(),
                 **_result_dict(runtime_result),
             },
@@ -542,13 +547,15 @@ def handle_device_add(args: Any) -> Result:
         if db.get_device_by_tag(user["uuid"], device_tag):
             return Result(False, error=f"Device already exists: {device_tag}")
 
-        awg_keys = awg.gen_awg_keys()
-        awg_ip = awg.get_awg_free_ip(
-            AWG_NETWORK,
+        vpn_keys = backend.generate_keys()
+        vpn_ip = backend.get_free_ip(
             db.get_used_ip_addresses(),
         )
-        if awg_ip is None:
-            return Result(False, error="No free AmneziaWG IP available")
+        if vpn_ip is None:
+            return Result(
+                False,
+                error=f"No free {backend.NAME} IP available",
+            )
 
         device_uuid = str(uuid.uuid4())
         created = db.create_device(
@@ -557,10 +564,10 @@ def handle_device_add(args: Any) -> Result:
                 "access_grant_uuid": user["uuid"],
                 "device_tag": device_tag,
                 "is_enabled": 1,
-                "wg_public_key": awg_keys["public_key"],
-                "wg_private_key": awg_keys["private_key"],
-                "wg_preshared_key": awg_keys.get("preshared_key"),
-                "wg_assigned_ip": awg_ip,
+                "wg_public_key": vpn_keys["public_key"],
+                "wg_private_key": vpn_keys["private_key"],
+                "wg_preshared_key": vpn_keys.get("preshared_key"),
+                "wg_assigned_ip": vpn_ip,
             }
         )
         if created is None:
@@ -595,7 +602,8 @@ def handle_device_add(args: Any) -> Result:
                 "grant_uuid": user["uuid"],
                 "device_uuid": device_uuid,
                 "device_tag": device_tag,
-                "awg_ip": awg_ip,
+                "vpn_backend": backend.NAME,
+                "vpn_ip": vpn_ip,
                 "config_path": config_path.as_posix(),
                 **_result_dict(runtime_result),
             },
