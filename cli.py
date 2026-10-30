@@ -36,7 +36,7 @@ def _add_device_selector(parser):
 def build_parser():
     parser = argparse.ArgumentParser(
         prog="vpnctl",
-        description="Manage AmneziaWG VPN access",
+        description="Manage VPN access",
     )
 
     subparsers = parser.add_subparsers(
